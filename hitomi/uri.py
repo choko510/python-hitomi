@@ -1,13 +1,15 @@
 """URI helpers mirroring the behaviour of the original library."""
 from __future__ import annotations
 
+import asyncio
 import re
+from threading import Lock
 from typing import Optional
 from urllib.parse import quote
 
 from .constants import BASE_DOMAIN, ErrorCode, IMAGE_URI_PARTS, RESOURCE_DOMAIN
 from .types import Gallery, Image, PopularityPeriod, StartingCharacter, Tag
-from .utility import HitomiError, fetch
+from .utility import HitomiError, async_fetch, fetch
 
 
 def get_nozomi_uri(options: Optional[dict] = None) -> str:
@@ -79,9 +81,14 @@ def get_gallery_uri(gallery: Gallery) -> str:
 
 
 class ImageUriResolver:
-    @staticmethod
-    def synchronize() -> None:
-        response_text = fetch(f"{RESOURCE_DOMAIN}/gg.js").decode("utf-8")
+    """Resolves image URIs with optional synchronous/asynchronous priming."""
+
+    _lock: Lock = Lock()
+    _async_lock: asyncio.Lock | None = None
+    _signature: tuple[str, bool, tuple[int, ...]] | None = None
+
+    @classmethod
+    def _parse_response(cls, response_text: str) -> tuple[str, bool, set[int]]:
         path_code = ""
         starts_with_a = False
         subdomain_codes: set[int] = set()
@@ -97,19 +104,78 @@ class ImageUriResolver:
                 case "c":
                     subdomain_codes.add(int(line[5:-1]))
 
-        IMAGE_URI_PARTS[0] = path_code
-        IMAGE_URI_PARTS[1] = starts_with_a
-        subdomain_set = IMAGE_URI_PARTS[2]
-        assert isinstance(subdomain_set, set)
-        subdomain_set.clear()
-        subdomain_set.update(subdomain_codes)
-
         if not path_code or not subdomain_codes:
             raise HitomiError(
                 ErrorCode.INVALID_VALUE,
                 "ImageUriResolver",
                 f"{{ pathCode: '{path_code}', startsWithA: {starts_with_a}, subdomainCodes: {len(subdomain_codes)} }}",
             )
+
+        return path_code, starts_with_a, subdomain_codes
+
+    @classmethod
+    def _apply_parts(
+        cls, path_code: str, starts_with_a: bool, subdomain_codes: set[int]
+    ) -> None:
+        IMAGE_URI_PARTS[0] = path_code
+        IMAGE_URI_PARTS[1] = starts_with_a
+        subdomain_set = IMAGE_URI_PARTS[2]
+        assert isinstance(subdomain_set, set)
+        subdomain_set.clear()
+        subdomain_set.update(subdomain_codes)
+        cls._signature = (path_code, starts_with_a, tuple(sorted(subdomain_codes)))
+
+    @classmethod
+    def _is_initialised(cls) -> bool:
+        signature = cls._signature
+        if signature is None:
+            return False
+        path_code, _, subdomain_codes = signature
+        return bool(path_code and subdomain_codes)
+
+    @classmethod
+    def synchronize(cls, *, force: bool = False) -> None:
+        if not force and cls._is_initialised():
+            return
+
+        with cls._lock:
+            if not force and cls._is_initialised():
+                return
+            response_text = fetch(f"{RESOURCE_DOMAIN}/gg.js").decode("utf-8")
+            parts = cls._parse_response(response_text)
+            cls._apply_parts(*parts)
+
+    @classmethod
+    async def async_synchronize(cls, *, force: bool = False) -> None:
+        if not force and cls._is_initialised():
+            return
+
+        with cls._lock:
+            if cls._async_lock is None:
+                cls._async_lock = asyncio.Lock()
+            lock = cls._async_lock
+
+        assert lock is not None
+        async with lock:
+            if not force and cls._is_initialised():
+                return
+            response_text = (await async_fetch(f"{RESOURCE_DOMAIN}/gg.js")).decode(
+                "utf-8"
+            )
+            parts = cls._parse_response(response_text)
+            cls._apply_parts(*parts)
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Reset the resolver state so that the next call re-fetches metadata."""
+
+        with cls._lock:
+            cls._signature = None
+            IMAGE_URI_PARTS[0] = ""
+            IMAGE_URI_PARTS[1] = False
+            subdomain_set = IMAGE_URI_PARTS[2]
+            assert isinstance(subdomain_set, set)
+            subdomain_set.clear()
 
     @staticmethod
     def get_image_uri(
