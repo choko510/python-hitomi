@@ -1,7 +1,10 @@
 """Utility helpers used by the Python implementation."""
 from __future__ import annotations
 
+import asyncio
 import http.client
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from typing import Dict, Optional
 from urllib.parse import urlsplit
 
@@ -35,6 +38,8 @@ _DEFAULT_HEADERS: Dict[str, str] = {
     "Connection": "keep-alive",
     "Referer": f"https://{BASE_DOMAIN}",
 }
+
+_FETCH_EXECUTOR = ThreadPoolExecutor()
 
 
 def _normalise_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -70,6 +75,15 @@ def fetch(uri: str, headers: Optional[Dict[str, str]] = None) -> bytes:
         return data
     finally:
         connection.close()
+
+
+async def async_fetch(
+    uri: str, headers: Optional[Dict[str, str]] = None
+) -> bytes:
+    """Asynchronous wrapper around :func:`fetch` using a thread executor."""
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_FETCH_EXECUTOR, fetch, uri, headers)
 
 
 def get_id_set(buffer: bytes, is_negative: bool = False) -> IdSet:
@@ -110,10 +124,24 @@ def _parse_node(data: bytes) -> Node:
     return keys, datas, subnodes
 
 
-def get_node_at_address(address: int, version: str) -> Optional[Node]:
-    data = fetch(
+@lru_cache(maxsize=256)
+def _get_node_bytes(address: int, version: str) -> bytes:
+    return fetch(
         f"{RESOURCE_DOMAIN}/galleriesindex/galleries.{version}.index",
         headers={"Range": f"bytes={address}-{address + 463}"},
+    )
+
+
+def get_node_at_address(address: int, version: str) -> Optional[Node]:
+    data = _get_node_bytes(address, version)
+    if data:
+        return _parse_node(data)
+    return None
+
+
+async def async_get_node_at_address(address: int, version: str) -> Optional[Node]:
+    data = await asyncio.get_running_loop().run_in_executor(
+        _FETCH_EXECUTOR, _get_node_bytes, address, version
     )
     if data:
         return _parse_node(data)
@@ -154,3 +182,41 @@ def binary_search(key: bytes, node: Node, version: str) -> Optional[tuple[int, i
     if next_node is None:
         return None
     return binary_search(key, next_node, version)
+
+
+async def async_binary_search(
+    key: bytes, node: Node, version: str
+) -> Optional[tuple[int, int]]:
+    if not node[0]:
+        return None
+
+    compare_result = -1
+    index = 0
+    keys, data_entries, subnodes = node
+    while index < len(keys):
+        current_key = keys[index]
+        if key < current_key:
+            compare_result = -1
+        elif key > current_key:
+            compare_result = 1
+        else:
+            compare_result = 0
+            break
+        if compare_result <= 0:
+            break
+        index += 1
+
+    if compare_result == 0:
+        return data_entries[index]
+
+    child_address = subnodes[index]
+    if child_address == 0:
+        return None
+
+    if all(address == 0 for address in subnodes):
+        return None
+
+    next_node = await async_get_node_at_address(child_address, version)
+    if next_node is None:
+        return None
+    return await async_binary_search(key, next_node, version)
